@@ -12,6 +12,9 @@ const dataDir = await mkdtemp(join(tmpdir(), "elevenlabs-mcp-smoke-"));
 let lastSpeechPath = "";
 let lastSpeechBody = null;
 let speechRequestCount = 0;
+let lastDialoguePath = "";
+let lastDialogueBody = null;
+let dialogueRequestCount = 0;
 
 const missingVoiceEnv = {
   ...process.env,
@@ -83,6 +86,19 @@ const mockApi = createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && req.url?.startsWith("/v1/text-to-dialogue")) {
+    dialogueRequestCount += 1;
+    lastDialoguePath = req.url;
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      lastDialogueBody = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "audio/mpeg", "Content-Length": fakeAudio.length });
+      res.end(fakeAudio);
+    });
+    return;
+  }
+
   res.writeHead(404).end();
 });
 
@@ -148,7 +164,7 @@ try {
 
   const health = await fetch(`http://127.0.0.1:${appPort}/health`).then((response) => response.json());
   assert.equal(health.status, "ok");
-  assert.equal(health.version, "0.2.6");
+  assert.equal(health.version, "0.3.0");
 
   const initialized = await mcpRequest("initialize", {
     protocolVersion: "2025-11-25",
@@ -166,7 +182,7 @@ try {
   const tools = await mcpRequest("tools/list");
   assert.deepEqual(
     tools.result.tools.map((tool) => tool.name).sort(),
-    ["generate_speech", "get_preferred_voice", "list_voices", "render_audio", "save_preferred_voice"],
+    ["generate_dialogue", "generate_speech", "get_preferred_voice", "list_voices", "render_audio", "save_preferred_voice"],
   );
   const toolDefinitions = Object.fromEntries(tools.result.tools.map((tool) => [tool.name, tool]));
   assert.equal(toolDefinitions.generate_speech._meta.ui, undefined);
@@ -231,6 +247,38 @@ try {
   assert.equal(audioResource.mimeType, "audio/mpeg");
   assert.equal(audioResource.size, fakeAudio.length);
   assert.equal(speechRequestCount, 1);
+
+  const dialogue = await mcpRequest("tools/call", {
+    name: "generate_dialogue",
+    arguments: {
+      inputs: [
+        { text: "Did you order this package?", voice_id: "voice-a" },
+        { text: "No. I thought it was yours.", voice_id: "voice-b" },
+      ],
+      language_code: "en",
+      output_format: "mp3_44100_128",
+      seed: 42,
+    },
+  });
+  assert.equal(dialogue.result.structuredContent.status, "ready");
+  assert.deepEqual(dialogue.result.structuredContent.voice_ids, ["voice-a", "voice-b"]);
+  assert.equal(dialogue.result.structuredContent.turn_count, 2);
+  assert.equal(dialogue.result.structuredContent.model_id, "eleven_v3");
+  assert.match(lastDialoguePath, /\/v1\/text-to-dialogue\?output_format=mp3_44100_128/);
+  assert.deepEqual(lastDialogueBody.inputs, [
+    { text: "Did you order this package?", voice_id: "voice-a" },
+    { text: "No. I thought it was yours.", voice_id: "voice-b" },
+  ]);
+  assert.equal(lastDialogueBody.language_code, "en");
+  assert.equal(lastDialogueBody.seed, 42);
+  assert.equal(lastDialogueBody.apply_text_normalization, "auto");
+  assert.equal(dialogueRequestCount, 1);
+
+  const dialogueRendered = await mcpRequest("tools/call", {
+    name: "render_audio",
+    arguments: { audio_id: dialogue.result.structuredContent.audio_id },
+  });
+  assert.equal(dialogueRendered.result.structuredContent.audio_id, dialogue.result.structuredContent.audio_id);
 
   const rendered = await mcpRequest("tools/call", {
     name: "render_audio",

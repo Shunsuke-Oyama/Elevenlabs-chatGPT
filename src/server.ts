@@ -14,7 +14,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 
 const APP_NAME = "ElevenLabs Audio for ChatGPT";
-const APP_VERSION = "0.2.6";
+const APP_VERSION = "0.3.0";
 const TEMPLATE_URI = "ui://widget/elevenlabs-audio-v6.html";
 const ELEVENLABS_API_BASE = (process.env.ELEVENLABS_API_BASE ?? "https://api.elevenlabs.io").replace(/\/$/, "");
 const ELEVENLABS_API_KEY = requiredEnv("ELEVENLABS_API_KEY");
@@ -23,6 +23,7 @@ const DEFAULT_VOICE_ID = requiredEnv("ELEVENLABS_VOICE_ID");
 const DEFAULT_MODEL_ID = process.env.ELEVENLABS_MODEL_ID?.trim() || "eleven_v3";
 const PORT = boundedInteger(process.env.PORT, 3000, 1, 65_535);
 const MAX_TEXT_LENGTH = boundedInteger(process.env.MAX_TEXT_LENGTH, 5_000, 1, 40_000);
+const MAX_DIALOGUE_TEXT_LENGTH = boundedInteger(process.env.MAX_DIALOGUE_TEXT_LENGTH, 2_000, 1, 10_000);
 const AUDIO_TTL_SECONDS = boundedInteger(process.env.AUDIO_TTL_SECONDS, 900, 60, 86_400);
 const MAX_CACHED_AUDIO_BYTES = boundedInteger(
   process.env.MAX_CACHED_AUDIO_BYTES,
@@ -82,6 +83,17 @@ const voiceSettingsSchema = z
     speed: z.number().min(0.7).max(1.2).optional().describe("Speech speed from 0.7 to 1.2."),
   })
   .optional();
+
+const dialogueInputsSchema = z
+  .array(
+    z.object({
+      text: z.string().min(1).max(MAX_DIALOGUE_TEXT_LENGTH).describe("One performance-ready dialogue turn."),
+      voice_id: z.string().min(1).describe("ElevenLabs voice ID for this turn."),
+    }),
+  )
+  .min(2)
+  .max(100)
+  .describe("Dialogue turns in playback order. Alternate voice IDs to create a natural conversation.");
 
 const SPEECH_PROMPTING_GUIDANCE = `Before calling generate_speech, prepare the text as a spoken performance while preserving the user's meaning, language, facts, names, and desired wording.
 - Write for the ear: use natural conversational phrasing, contractions where appropriate, and punctuation that creates human rhythm.
@@ -272,7 +284,7 @@ function createMcpServer(origin: string): McpServer {
     { name: "elevenlabs-audio", version: APP_VERSION },
     {
       instructions:
-        `To create audio, call generate_speech exactly once. After it succeeds, immediately call render_audio exactly once with the returned audio_id before replying to the user. Never call generate_speech again merely to render the player, and never invent an audio_id. Keep the signed MP3 link as the fallback when a host cannot display the widget. When no voice is named, call get_preferred_voice. If none is configured, call list_voices, ask the user which voice they want, and call save_preferred_voice only after they choose. Use generate_speech only when the user explicitly wants audio. Generated audio is temporary.\n\n${SPEECH_PROMPTING_GUIDANCE}`,
+        `To create single-speaker audio, call generate_speech exactly once. To create a multi-speaker conversation, call generate_dialogue exactly once with the turns in playback order. After either generation tool succeeds, immediately call render_audio exactly once with the returned audio_id before replying to the user. Never call a generation tool again merely to render the player, and never invent an audio_id. Keep the signed MP3 link as the fallback when a host cannot display the widget. When a voice is not known, call list_voices. Use audio generation only when the user explicitly wants audio. Generated audio is temporary.\n\n${SPEECH_PROMPTING_GUIDANCE}`,
     },
   );
 
@@ -616,6 +628,132 @@ function createMcpServer(origin: string): McpServer {
             mimeType: contentType,
             fileName: cached.entry.fileName,
           },
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "generate_dialogue",
+    {
+      title: "Generate multi-speaker dialogue with ElevenLabs",
+      description:
+        "Use this when the user explicitly asks for a conversation with two or more voices. Provide each turn in playback order with its ElevenLabs voice ID. This consumes the deployer's ElevenLabs credits.",
+      inputSchema: {
+        inputs: dialogueInputsSchema,
+        model_id: z.string().min(1).optional().describe("Dialogue model ID. Omit to use eleven_v3."),
+        language_code: z.string().length(2).optional().describe("Optional ISO 639-1 language code, such as en."),
+        output_format: outputFormatSchema.default("mp3_44100_128").describe("MP3 quality and bitrate."),
+        seed: z.number().int().min(0).max(4_294_967_295).optional(),
+        apply_text_normalization: z.enum(["auto", "on", "off"]).default("auto"),
+      },
+      outputSchema: {
+        status: z.literal("ready"),
+        audio_id: z.string().uuid(),
+        voice_ids: z.array(z.string()),
+        model_id: z.string(),
+        output_format: z.string(),
+        character_count: z.number().int(),
+        turn_count: z.number().int(),
+        expires_at: z.string(),
+        audio: z.object({
+          url: z.string().url(),
+          mime_type: z.string(),
+          file_name: z.string(),
+          size_bytes: z.number().int(),
+        }),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: false,
+      },
+      _meta: {
+        "openai/toolInvocation/invoking": "Bringing the conversation to life…",
+        "openai/toolInvocation/invoked": "Dialogue generated.",
+      },
+    },
+    async ({ inputs, model_id, language_code, output_format, seed, apply_text_normalization }) => {
+      const normalizedInputs = inputs.map((turn) => ({
+        text: turn.text.trim(),
+        voice_id: turn.voice_id.trim(),
+      }));
+      const characterCount = normalizedInputs.reduce((total, turn) => total + turn.text.length, 0);
+      if (characterCount > MAX_DIALOGUE_TEXT_LENGTH) {
+        throw new Error(
+          `Dialogue text is ${characterCount} characters; the configured limit is ${MAX_DIALOGUE_TEXT_LENGTH}. Split it into shorter episodes.`,
+        );
+      }
+      const voiceIds = [...new Set(normalizedInputs.map((turn) => turn.voice_id))];
+      if (voiceIds.length < 2) throw new Error("Dialogue requires at least two unique voice IDs.");
+      if (voiceIds.length > 10) throw new Error("ElevenLabs supports at most 10 unique voice IDs per dialogue.");
+
+      const selectedModelId = model_id?.trim() || "eleven_v3";
+      const body: Record<string, unknown> = {
+        inputs: normalizedInputs,
+        model_id: selectedModelId,
+        apply_text_normalization,
+      };
+      if (language_code) body.language_code = language_code;
+      if (seed !== undefined) body.seed = seed;
+
+      const response = await withGenerationLimit(() =>
+        elevenLabsRequest(`/v1/text-to-dialogue?output_format=${encodeURIComponent(output_format)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "audio/mpeg" },
+          body: JSON.stringify(body),
+        }),
+      );
+
+      const advertisedLength = Number(response.headers.get("content-length") ?? 0);
+      if (advertisedLength > MAX_SINGLE_AUDIO_BYTES) throw new Error("Generated audio exceeds the configured size limit.");
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get("content-type")?.split(";")[0] || "audio/mpeg";
+      const cached = cacheAudio(bytes, contentType, {
+        voiceId: voiceIds.join(","),
+        modelId: selectedModelId,
+        outputFormat: output_format,
+        characterCount,
+      });
+      const expiresAtIso = new Date(cached.entry.expiresAt).toISOString();
+      const audioUrl = signedAudioUrl(origin, cached.id, cached.entry.expiresAt);
+
+      return {
+        structuredContent: {
+          status: "ready" as const,
+          audio_id: cached.id,
+          voice_ids: voiceIds,
+          model_id: selectedModelId,
+          output_format,
+          character_count: characterCount,
+          turn_count: normalizedInputs.length,
+          expires_at: expiresAtIso,
+          audio: {
+            url: audioUrl,
+            mime_type: contentType,
+            file_name: cached.entry.fileName,
+            size_bytes: bytes.length,
+          },
+        },
+        content: [
+          {
+            type: "text" as const,
+            text: `The ElevenLabs dialogue is ready. Call render_audio now with audio_id "${cached.id}" to display the inline player. The temporary MP3 fallback is ${audioUrl} (available until ${expiresAtIso}).`,
+          },
+          {
+            type: "resource_link" as const,
+            uri: audioUrl,
+            name: cached.entry.fileName,
+            title: "Open ElevenLabs dialogue",
+            description: `Temporary MP3 available until ${expiresAtIso}.`,
+            mimeType: contentType,
+            size: bytes.length,
+          },
+        ],
+        _meta: {
+          audio: { url: audioUrl, mimeType: contentType, fileName: cached.entry.fileName },
         },
       };
     },
