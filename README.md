@@ -9,6 +9,7 @@ Each person deploys their own private instance and supplies their own ElevenLabs
 ## What it includes
 
 - `generate_speech`: creates temporary MP3 audio with an ElevenLabs voice.
+- `generate_dialogue`: creates one MP3 conversation from ordered turns using two or more ElevenLabs voices.
 - `render_audio`: displays an already-generated MP3 without calling ElevenLabs or consuming more credits.
 - `list_voices`: searches the voices available to the deployer's account.
 - `get_preferred_voice`: checks whether the person has already chosen a default voice.
@@ -110,6 +111,7 @@ ChatGPT requires a public HTTPS address, so use a tunnel for local testing and a
 | `ELEVENLABS_VOICE_ID` | — | Required ElevenLabs voice ID used when a tool call omits `voice_id`; users can override it through the saved preference. |
 | `ELEVENLABS_MODEL_ID` | `eleven_v3` | Default TTS model. Eleven v3 gives the model the most expressive delivery controls. |
 | `MAX_TEXT_LENGTH` | `5000` | Maximum characters accepted per generation. |
+| `MAX_DIALOGUE_TEXT_LENGTH` | `2000` | Maximum total characters across dialogue turns; 2,000 is ElevenLabs' reliable-generation recommendation. |
 | `AUDIO_TTL_SECONDS` | `900` | How long generated audio remains available. |
 | `MAX_CACHED_AUDIO_BYTES` | `52428800` | Maximum total in-memory audio cache. |
 | `MAX_GENERATIONS_PER_MINUTE` | `10` | Per-instance burst limit protecting ElevenLabs credits. |
